@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  postgres-warehouse:
+    image: bitnami/postgresql:latest
+    container_name: postgres_container
+    environment:
+      POSTGRES_USER: username
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: userdb
+    ports:
+      - "5439:5439"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - pipeline_network
+
+volumes:
+  postgres_data:

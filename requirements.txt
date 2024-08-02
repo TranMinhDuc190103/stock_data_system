@@ -1,0 +1,12 @@
+polars
+requests
+minio
+pandas
+python-dotenv
+resend
+boto3
+apache-airflow-providers-postgres
+psycopg2-binary
+sqlalchemy
+urllib3
+bs4
