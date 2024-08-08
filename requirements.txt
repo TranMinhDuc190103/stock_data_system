@@ -10,3 +10,4 @@ psycopg2-binary
 sqlalchemy
 urllib3
 bs4
+lxml

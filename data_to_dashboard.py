@@ -12,8 +12,6 @@ conn = psycopg2.connect(
     port=5439,
 )
 
-
-
 # Query to get the data
 sql = '''
     SELECT * FROM public."IBM";
