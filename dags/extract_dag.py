@@ -394,7 +394,6 @@ def load_data(**kwargs):
                 print(f"Operation failed. Error: {oe}. Retry again.")
             except Exception as e:
                 print(e)
-                break
     
     cursor.execute(
         """
