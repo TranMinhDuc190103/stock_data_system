@@ -11,3 +11,4 @@ sqlalchemy
 urllib3
 bs4
 lxml
+yfinance
