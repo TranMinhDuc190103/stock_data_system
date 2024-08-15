@@ -175,6 +175,7 @@ def backup_full(**kwargs):
 
     # Secure full backup
     for filename in list_filenames:
+        
         csv_content = minio_client.get_object(
             bucket_name=bucket_name_1, obj_name=filename).data.decode('utf-8')
         csv_reader = csv.reader(io.StringIO(csv_content))
@@ -204,11 +205,11 @@ def daily_update(**kwargs):
     # # Retry strategy
     # max_retries = 5
 
-    # midnight = datetime.now(timezone.utc).replace(
-    #     hour=0, minute=0, second=0, microsecond=0)
-    # a_day_ago = midnight - timedelta(days=1)
-    # current_day = int(midnight.timestamp())
-    # a_day_ago = int(a_day_ago.timestamp())
+    midnight = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    a_day_ago = midnight - timedelta(days=1)
+    current_day = int(midnight.timestamp())
+    a_day_ago = int(a_day_ago.timestamp())
 
     # for symbol in symbols:
 

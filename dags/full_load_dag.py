@@ -21,8 +21,8 @@ import csv
 import pandas as pd
 from datetime import datetime, timezone
 import logging
-import os
-import glob
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 
 # Load environment variables
 config = dotenv_values("dags/.env")
@@ -260,123 +260,130 @@ def extract_HTML_content(**kwargs):
                         f"File {filename} written successfully. Put into the {bucket_name} bucket.")
                 minio_client.put_object(bucket_name=bucket_name,
                                         obj_name=filename, obj_file=f'{symbol_name}.html')
-            time.sleep(5)
+            time.sleep(2)
         except Exception as e:
             logging.error(f"{symbol}.html could not be downloaded. Error: {e}")
             with open("dags/error_log_extract/error_log.txt", "a") as f:
                 f.write(f"{symbol}\n")
-            time.sleep(10)
+            time.sleep(2)
             continue
 
 # Extract data from HTML content task
 
 
 def transform_data_from_HTML(**kwargs):
-
+    # Arguments for the function
     bucket_name_1 = kwargs.get("bucket_name_1")
     bucket_name_2 = kwargs.get("bucket_name_2")
 
-    # print(symbols)
+    # MinIO client
     minio_client = MinioClient(
         "minio", "9000", access_key=access_key, secret_key=secret_key)
-    symbols = extract_symbol_list()
-    list_objects = minio_client.list_objects(
-        bucket_name=bucket_name_2, prefix="yahoo_data_info/")
-    for symbol in symbols:
-
-        # Filename
-        filename = f"yahoo_data_info/{symbol}.json"
-        if filename in list_objects:
-            continue
-
-        # Extract HTML content from landing zone
+    
+    # List of symbols
+    list_filenames = minio_client.list_objects(bucket_name=bucket_name_1, prefix="yahoo_data_info/")
+    # with open('dags/error_log_transform/error_log.txt', 'r') as f:
+    #     error_symbols = f.readlines()
+    #     first_error_symbol = error_symbols[0]
+    
+    # Checkpoint
+    check = False
+    for filename in list_filenames:
+        
+        # if filename == str(first_error_symbol).split("\n")[0]:
+        #     check = True
+            
+        # if check == False:
+        #     continue
+        
         try:
+            # Symbol
+            symbol = filename.split("/")[1].split(".")[0]
+            
+            # Extract HTML content from landing zone
             html_content = minio_client.get_object(
-                bucket_name=bucket_name_1, obj_name=f"yahoo_data_info/{symbol}.html", prefix="yahoo_data_info/").data.decode('utf-8')
-        except Exception as e:
-            filename_html = f"yahoo_data_info/{symbol}.html"
-            if filename_html not in minio_client.list_objects(bucket_name=bucket_name_1, prefix="yahoo_data_info/"):
+                bucket_name=bucket_name_1, obj_name=filename, prefix="yahoo_data_info/").data.decode('utf-8')
+
+            # Parse HTML content
+            tree = html.fromstring(html_content)
+
+            # Extract element using XPATH
+            # Type of stock: KeyExecutives or ETFSummary or unknown
+            try:
+                type = tree.xpath("//article/section[2]/section[1]/header[1]/h3[1]/text()")[
+                    0].replace('\n', '').replace(' ', '')
+            except Exception as e:
+                minio_client.delete_objects(bucket_name=bucket_name_1, obj_name_list=[
+                                            filename], prefix="yahoo_data_info/")
                 continue
-            minio_client.delete_objects(bucket_name=bucket_name_1, obj_name_list=[
-                                        f"yahoo_data_info/{symbol}.html"], prefix="yahoo_data_info/")
-            continue
 
-        # Parse HTML content
-        tree = html.fromstring(html_content)
+            # Info of stock as a dictionary
+            result = dict()
 
-        # Extract element using XPATH
-        # Type of stock: KeyExecutives or ETFSummary
-        try:
-            type = tree.xpath("//article/section[2]/section[1]/header[1]/h3[1]/text()")[
-                0].replace('\n', '').replace(' ', '')
+            # Company stock
+            if type == 'KeyExecutives':
+                result['Type'] = 'Corpo stock'
+                description = tree.xpath(
+                    "//article/section[2]/section[1]/div[1]/text()")
+                # Description check
+                if len(description) == 3:
+                    result['Sector'] = 'Unknown'
+                    result['Industry'] = 'Unknown'
+                    result['Description'] = 'None'
+
+                else:
+                    sector = tree.xpath(
+                        "//article/section[2]/section[2]/div[1]/dl[1]/div[1]/dd[1]/a/text()")
+                    if len(sector) == 0:
+                        result['Sector'] = 'Unknown'
+                    else:
+                        result['Sector'] = sector[0].replace('\n   ', '')
+                    industry = tree.xpath(
+                        "//article/section[2]/section[2]/div[1]/dl[1]/div[2]/a/text()")
+                    if len(industry) == 0:
+                        result['Industry'] = 'Unknown'
+                    else:
+                        result['Industry'] = industry[0].replace('\n   ', '')
+                    result['Description'] = description[0].replace('\n   ', '')
+
+            # ETF stock
+            elif type == 'ETFSummary':
+                result['Type'] = 'ETF stock'
+                description = tree.xpath(
+                    "//article/section[2]/section[1]/p/text()")
+                if len(description) == 0:
+                    result['Category'] = 'Unknown'
+                    result['Fund Family'] = 'Unknown'
+                    result['Net Assets'] = 'Unknown'
+                    result['Legal Type'] = 'Unknown'
+                    result['Description'] = 'Unknown'
+                else:
+                    result['Category'] = tree.xpath(
+                        '//article/section[2]/section[2]/div/table/tbody/tr[1]/td[2]/text()')[0].replace('\n   ', '')
+                    result['Fund Family'] = tree.xpath(
+                        '//article/section[2]/section[2]/div/table/tbody/tr[2]/td[2]/text()')[0].replace('\n   ', '')
+                    result['Net Assets'] = tree.xpath(
+                        '//article/section[2]/section[2]/div/table/tbody/tr[3]/td[2]/text()')[0].replace('\n   ', '')
+                    result['Legal Type'] = tree.xpath(
+                        '//article/section[2]/section[2]/div/table/tbody/tr[6]/td[2]/text()')[0].replace('\n   ', '')
+                    result['Description'] = description[0].replace('\n   ', '')
+            with open(f'{symbol}.json', 'w') as f:
+                json.dump(result, f, indent=4, ensure_ascii=False)
+            minio_client.put_object(bucket_name=bucket_name_2,
+                                    obj_name=f'{symbol}.json', obj_file=f'{symbol}.json')
+            logging.info(f"File {f'{symbol}.json'} written successfully. Put into the {bucket_name_2} bucket.")
         except Exception as e:
-            minio_client.delete_objects(bucket_name=bucket_name_1, obj_name_list=[
-                                        f"yahoo_data_info/{symbol}.html"], prefix="yahoo_data_info/")
+            logging.error("Error: " + str(e))
+            with open("dags/error_log_transform/error_log.txt", "a") as f:
+                f.write(filename + "\n")
             continue
-
-        # Info of stock as a dictionary
-        result = dict()
-
-        # Company stock
-        if type == 'KeyExecutives':
-            result['Type'] = 'Corpo stock'
-            description = tree.xpath(
-                "//article/section[2]/section[1]/div[1]/text()")
-            # Description check
-            if len(description) == 3:
-                result['Sector'] = None
-                result['Industry'] = None
-                result['Description'] = None
-
-            else:
-                sector = tree.xpath(
-                    "//article/section[2]/section[2]/div[1]/dl[1]/div[1]/dd[1]/a/text()")
-                if len(sector) == 0:
-                    result['Sector'] = None
-                else:
-                    result['Sector'] = sector[0].replace('\n   ', '')
-                industry = tree.xpath(
-                    "//article/section[2]/section[2]/div[1]/dl[1]/div[2]/a/text()")
-                if len(industry) == 0:
-                    result['Industry'] = None
-                else:
-                    result['Industry'] = industry[0].replace('\n   ', '')
-                result['Description'] = description[0].replace('\n   ', '')
-
-        # ETF stock
-        elif type == 'ETFSummary':
-            result['Type'] = 'ETF stock'
-            description = tree.xpath(
-                "//article/section[2]/section[1]/p/text()")
-            if len(description) == 0:
-                result['Category'] = None
-                result['Fund Family'] = None
-                result['Net Assets'] = None
-                result['Legal Type'] = None
-                result['Description'] = None
-            else:
-                result['Category'] = tree.xpath(
-                    '//article/section[2]/section[2]/div/table/tbody/tr[1]/td[2]/text()')[0].replace('\n   ', '')
-                result['Fund Family'] = tree.xpath(
-                    '//article/section[2]/section[2]/div/table/tbody/tr[2]/td[2]/text()')[0].replace('\n   ', '')
-                result['Net Assets'] = tree.xpath(
-                    '//article/section[2]/section[2]/div/table/tbody/tr[3]/td[2]/text()')[0].replace('\n   ', '')
-                result['Legal Type'] = tree.xpath(
-                    '//article/section[2]/section[2]/div/table/tbody/tr[6]/td[2]/text()')[0].replace('\n   ', '')
-                result['Description'] = description[0].replace('\n   ', '')
-        with open(f'{symbol}.json', 'w') as f:
-            json.dump(result, f, indent=4, ensure_ascii=False)
-        minio_client.put_object(bucket_name=bucket_name_2,
-                                obj_name=filename, obj_file=f'{symbol}.json')
-        print(
-            f"File {filename} written successfully. Put into the {bucket_name_2} bucket.")
+            
 
 
 def load_data(**kwargs):
     bucket_name_1 = kwargs['bucket_name_1']
     bucket_name_2 = kwargs['bucket_name_2']
     max_retries = kwargs['max_retries']
-    ti = kwargs['ti']
 
     # Minio client
     minio_client = MinioClient('minio', 9000, access_key, secret_key)
@@ -392,18 +399,18 @@ def load_data(**kwargs):
     #     error_symbols = f.readlines()
     #     first_error_symbol = error_symbols[0]
 
-    # check = False
+    check = False
 
     # Check through every symbol
     for symbol in list_symbols:
 
         # Check if the symbol is the most recent error
-        # if symbol == first_error_symbol:
-        #     check = True
+        if symbol == "AMIX":
+            check = True
 
         # Skip the symbols before the most recent error
-        # if check == False:
-        #     continue
+        if check == False:
+            continue
 
         # Start time
         start_time = time.time()
@@ -464,6 +471,7 @@ def load_data(**kwargs):
                                 DO UPDATE SET type = '{type}', description = '{description.replace("'", '"')}', status = '{status}';
                                 """)
 
+                conn.commit()
                 # Historical data
                 csv_content = minio_client.get_object(
                     bucket_name=bucket_name_2, obj_name=filename_csv)

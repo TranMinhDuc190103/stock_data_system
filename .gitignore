@@ -168,3 +168,5 @@ unused/
 *_data*/
 *.csv
 .vscode
+
+config/
