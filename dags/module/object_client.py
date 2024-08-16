@@ -1,4 +1,5 @@
 from minio import Minio
+from minio.commonconfig import CopySource
 
 class MinioClient:
     
@@ -56,3 +57,8 @@ class MinioClient:
     def list_objects(self, bucket_name, prefix=None):
         self.check_bucket(bucket_name=bucket_name)
         return [obj.object_name for obj in self.client.list_objects(bucket_name=bucket_name, prefix=prefix)]
+
+    # COPY object from one bucket to another
+    def copy_object(self, bucket_name_from, bucket_name_to, obj_name, prefix_1=None, prefix_2=None):
+        self.check_object(bucket_name=bucket_name_from, obj_name=obj_name, prefix=prefix_1)
+        self.client.copy_object(bucket_name=bucket_name_to, object_name=f"{prefix_2}/{obj_name}", source=CopySource(bucket_name=bucket_name_from, object_name=obj_name))

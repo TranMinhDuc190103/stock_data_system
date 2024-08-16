@@ -44,7 +44,6 @@ host = config['host']
 conn_string = config['conn_string']
 db = create_engine(conn_string)
 conn_1 = db.connect()
-# conn_1.autocommit = True
 
 conn = psycopg2.connect(
     host=host,
@@ -71,10 +70,11 @@ default_args = {
 
 # DAG definition
 dag = DAG(
-    dag_id="extract_dag",
+    dag_id="full_load_dag",
     start_date=datetime(year=2024,
                         month=7,
                         day=23),
+    schedule_interval=None,
     on_failure_callback=retry.email_on_failure,
     on_success_callback=retry.email_on_success,
     default_args=default_args
@@ -279,27 +279,28 @@ def transform_data_from_HTML(**kwargs):
     # MinIO client
     minio_client = MinioClient(
         "minio", "9000", access_key=access_key, secret_key=secret_key)
-    
+
     # List of symbols
-    list_filenames = minio_client.list_objects(bucket_name=bucket_name_1, prefix="yahoo_data_info/")
+    list_filenames = minio_client.list_objects(
+        bucket_name=bucket_name_1, prefix="yahoo_data_info/")
     # with open('dags/error_log_transform/error_log.txt', 'r') as f:
     #     error_symbols = f.readlines()
     #     first_error_symbol = error_symbols[0]
-    
+
     # Checkpoint
     check = False
     for filename in list_filenames:
-        
+
         # if filename == str(first_error_symbol).split("\n")[0]:
         #     check = True
-            
+
         # if check == False:
         #     continue
-        
+
         try:
             # Symbol
             symbol = filename.split("/")[1].split(".")[0]
-            
+
             # Extract HTML content from landing zone
             html_content = minio_client.get_object(
                 bucket_name=bucket_name_1, obj_name=filename, prefix="yahoo_data_info/").data.decode('utf-8')
@@ -371,16 +372,18 @@ def transform_data_from_HTML(**kwargs):
                 json.dump(result, f, indent=4, ensure_ascii=False)
             minio_client.put_object(bucket_name=bucket_name_2,
                                     obj_name=f'{symbol}.json', obj_file=f'{symbol}.json')
-            logging.info(f"File {f'{symbol}.json'} written successfully. Put into the {bucket_name_2} bucket.")
+            logging.info(
+                f"File {f'{symbol}.json'} written successfully. Put into the {bucket_name_2} bucket.")
         except Exception as e:
             logging.error("Error: " + str(e))
             with open("dags/error_log_transform/error_log.txt", "a") as f:
                 f.write(filename + "\n")
             continue
-            
 
 
 def load_data(**kwargs):
+    
+    # Argument for the function
     bucket_name_1 = kwargs['bucket_name_1']
     bucket_name_2 = kwargs['bucket_name_2']
     max_retries = kwargs['max_retries']
@@ -395,9 +398,10 @@ def load_data(**kwargs):
     list_symbols = [x.split('.')[0] for x in list_filenames]
 
     # Check log files
-    # with open("dags/error_log_load/error_log.txt", "r") as f:
-    #     error_symbols = f.readlines()
-    #     first_error_symbol = error_symbols[0]
+    with open("dags/error_log_load/error_log.txt", "r") as f:
+        error_symbols = f.readlines()
+        if len(error_symbols) != 0:
+            first_error_symbol = error_symbols[0]
 
     check = False
 
@@ -405,17 +409,15 @@ def load_data(**kwargs):
     for symbol in list_symbols:
 
         # Check if the symbol is the most recent error
-        if symbol == "AMIX":
-            check = True
+        # if symbol == "AMIX":
+        #     check = True
 
         # Skip the symbols before the most recent error
-        if check == False:
-            continue
+        # if check == False:
+        #     continue
 
         # Start time
         start_time = time.time()
-
-        # ID
 
         # Filename to extract data
         filename_json = f"yahoo_data_info/{symbol}.json"
@@ -424,12 +426,18 @@ def load_data(**kwargs):
         # Iterate through attempt, max_retries = 5
         retries = 0
         while retries < max_retries:
+            
+            # Case not encountering error
             try:
+                
+                # JSON content
                 json_content = minio_client.get_object(
                     bucket_name=bucket_name_1, obj_name=filename_json, prefix="yahoo_data_info/").json()
+                
                 # Stock info
                 info_id = f'INFO_{symbol}'
                 type = json_content['Type']
+                
                 # Categorize according to type
                 if type == 'Corpo stock':
                     sector = json_content['Sector']
@@ -453,7 +461,10 @@ def load_data(**kwargs):
                                     """)
 
                 description = json_content['Description']
+                
+                # Check stock status: Active or disabled
                 status = None
+
                 if description is None:
                     status = "Disabled"
                     cursor.execute(f"""
@@ -472,39 +483,94 @@ def load_data(**kwargs):
                                 """)
 
                 conn.commit()
+                
                 # Historical data
+                # Extract CSV content into a DataFrame
                 csv_content = minio_client.get_object(
                     bucket_name=bucket_name_2, obj_name=filename_csv)
-                df = pd.read_csv(csv_content, index_col=0)
+                df = pd.read_csv(csv_content)
                 df["Symbol"] = symbol
-                df.to_sql('temp_dim_hist_data', conn_1, if_exists='append',
-                            index=True, method="multi", chunksize=1000)
-                # print(f"Runtime: {time.time() - start_time} seconds")
+                
+                # Check if error while loading historical data
+                try:
+                    
+                    # Load in batches of 2000 rows
+                    for start in range(0, len(df), 2000):
+                        
+                        # Check if the remaining rows are less than 2000
+                        end = min(start + 2000, len(df))
+                        
+                        # Extract into batch
+                        batch_df = df.iloc[start:end]
+                        rows = [tuple(x) for x in batch_df.values.tolist()]
+                        args_str = ','.join(cursor.mogrify("(%s,%s,%s,%s,%s,%s,%s,%s)", x).decode('utf-8') for x in rows)
+                        # Check if row encounter error
+                        try:
+                            upsert_query = f'''
+                                            INSERT INTO dim_hist_data ("Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Symbol")
+                                            VALUES {args_str}
+                                            ON CONFLICT ("Symbol", "Date")
+                                            DO UPDATE SET
+                                            "Open" = EXCLUDED."Open",
+                                            "High" = EXCLUDED."High",
+                                            "Low" = EXCLUDED."Low",
+                                            "Close" = EXCLUDED."Close",
+                                            "Adj Close" = EXCLUDED."Adj Close",
+                                            "Volume" = EXCLUDED."Volume"
+                                            '''
+                            cursor.execute(upsert_query)
+                            conn.commit()
+                            
+                        # Case encountering error
+                        except Exception as e:
+                            
+                            # Rollback into attempting to load again. If error, continue.
+                            conn.rollback()
+                            for _, row in batch_df.iterrows():
+                                try:
+                                    upsert_query = '''
+                                            INSERT INTO dim_hist_data ("Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Symbol")
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                            ON CONFLICT ("Symbol", "Date")
+                                            DO UPDATE SET
+                                            "Open" = EXCLUDED."Open",
+                                            "High" = EXCLUDED."High",
+                                            "Low" = EXCLUDED."Low",
+                                            "Close" = EXCLUDED."Close",
+                                            "Adj Close" = EXCLUDED."Adj Close",
+                                            "Volume" = EXCLUDED."Volume"    
+                                            '''
+                                    cursor.execute(upsert_query, tuple(row))
+                                    conn.commit()
+                                
+                                # Case encountering error again, rollback then log error and continue
+                                except Exception as row_error:
+                                    conn.rollback()
+                                    logging.getLogger("dags/error_log_load/error_log_hist_data.log").error(f"Error: {row_error}.")
+                                    continue
+                except Exception as e:
+                    logging.getLogger(
+                        "dags/error_log_load/error_log_hist_data.log").error(f"Error: {e}. Symbol: {symbol}")
+                    break
+
+                # Supposed loading is successful, log runtime then end the retry loop
                 logging.info(
                     f"Runtime: {time.time() - start_time} seconds. Symbol: {symbol}")
                 break
+                
+            # Retry attempt
             except psycopg2.OperationalError as oe:
                 retries += 1
                 print(f"Operation failed. Error: {oe}. Retry again.")
+            
+            # Case encountering error: Log error and continue
             except Exception as e:
+                conn.rollback()
+                logging.error(f"Error: Symbol: {symbol}. Error: {e}")
                 with open("dags/error_log_load/error_log.txt", "a") as f:
                     f.write(f"{symbol}\n")
                 break
 
-    cursor.execute(
-        """
-        INSERT into dim_hist_data
-        SELECT * FROM temp_dim_hist_data
-        ON CONFLICT ("Symbol", "Date")
-        DO UPDATE SET
-        dim_hist_data."Open" = temp_dim_hist_data."Open",
-        dim_hist_data."High" = temp_dim_hist_data."High",
-        dim_hist_data."Low" = temp_dim_hist_data."Low",
-        dim_hist_data."Close" = temp_dim_hist_data."Close",
-        dim_hist_data."Adj Close" = temp_dim_hist_data."Adj Close",
-        dim_hist_data."Volume" = temp_dim_hist_data."Volume"
-        """
-    )
     conn_1.close()
     conn.close()
 

@@ -169,4 +169,4 @@ unused/
 *.csv
 .vscode
 
-config/
+config
