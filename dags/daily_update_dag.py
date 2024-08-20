@@ -19,6 +19,10 @@ import csv
 import io
 import json
 import logging
+from multiprocessing import cpu_count
+from multiprocessing.pool import ThreadPool
+import random
+from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
 config = dotenv_values("dags/.env")
@@ -85,7 +89,7 @@ def extract_symbol_list():
             [line[0]], columns=['Symbol'])], ignore_index=True)
     return key_df['Symbol'].tolist()
 
-# Extract daily data, up to 7 backups
+# def download_url(url):
 
 
 def extract_data_weekly(**kwargs):
@@ -94,7 +98,7 @@ def extract_data_weekly(**kwargs):
     bucket_name = kwargs.get("bucket_name")
 
     # Retry strategy
-    max_retries = 5
+    max_retries=5
     delay = 60
 
     # Header for requests
@@ -104,84 +108,57 @@ def extract_data_weekly(**kwargs):
     minio_client = MinioClient('minio', 9000, access_key, secret_key)
 
     # Get timestamp
-    midnight = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0)
+    midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     a_week_ago = midnight - timedelta(days=7)
     current_day = int(midnight.timestamp())
     a_week_ago = int(a_week_ago.timestamp())
-
-    # Checkpoint for first error symbol
-    check = False
-    first_error = None
-
-    # List error symbols
-    with open("dags/error_log_backup/error_log_weekly_data/error_log.txt", "r") as f:
-        lines = f.readlines()
-        if len(lines) == 0:
-            check = True
-        else:
-            first_error = lines[0]
-
-    # Extract CSV content
-    for symbol in symbols:
-
-        if symbol == first_error:
-            check = True
-
-        if check == False:
-            continue
-
-        # Filename
-        filename = f'backup_{datetime.today().strftime(' % Y-%m-%d')}/{symbol}.csv'
-
-        # Retry logic attempt
+    
+    url_1 = lambda symbol: f"https://query1.finance.yahoo.com/v7/finance/download/{symbol}?period1={a_week_ago}&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
+    
+    url_2 = lambda symbol: f"https://query2.finance.yahoo.com/v7/finance/download/{symbol}?period1={a_week_ago}&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
+    
+    filename_func = lambda symbol: f"backup_{datetime.today().strftime('%Y-%m-%d')}/{symbol}.csv"
+        
+    urls_1 = [url_1(symbol) for symbol in symbols]
+    urls_2 = [url_2(symbol) for symbol in symbols]
+    inputs = zip(urls_1, urls_2, symbols)
+    
+    def download_url(args):
+        url_1, url_2, symbol = args[0], args[1], args[2]
+        start = time.time()
         for attempt in range(max_retries):
-
-            # URL for requests
-            def url(
-                x): return f"https://query{x}.finance.yahoo.com/v7/finance/download/{symbol}?period1={a_week_ago}&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
-
-            # Check query1
             try:
-                response = requests.get(url(1), headers=headers)
-                # Check response status code
+                response = requests.get(url_1, headers=headers)
                 if response.status_code == 200:
                     with open(f'{symbol}.csv', 'wb') as f:
                         f.write(response.content)
                     minio_client.put_object(
-                        bucket_name=bucket_name, obj_name=filename, obj_file=f'{symbol}.csv')
-                    print(f'Successfully downloaded {symbol} to {filename}')
-                    break
+                        bucket_name=bucket_name, obj_name=filename_func(symbol), obj_file=f'{symbol}.csv')
+                    logging.info(f"Successful backup. Symbol: {symbol}. Runtime: {time.time() - start}")
+                    return (symbol, time.time() - start)
                 elif response.status_code == 429:
                     time.sleep(delay)
             except Exception as e:
-                # query1 failed
                 try:
-                    response = requests.get(url(2), headers=headers)
-                    # Check response status code
+                    response = requests.get(url_2, headers=headers)
                     if response.status_code == 200:
                         with open(f'{symbol}.csv', 'wb') as f:
                             f.write(response.content)
                         minio_client.put_object(
-                            bucket_name=bucket_name, obj_name=filename, obj_file=f'{symbol}.csv')
-                        print(
-                            f'Successfully downloaded {symbol} to {filename}')
-                        break
+                            bucket_name=bucket_name, obj_name=filename_func(symbol), obj_file=f'{symbol}.csv')
+                        logging.info(f"Successful backup. Symbol: {symbol}. Runtime: {time.time() - start}")
+                        return (symbol, time.time() - start)
                     elif response.status_code == 429:
                         time.sleep(delay)
-                    # query2 failed
                 except Exception as e:
-                    logging.info(
-                        f"Failed to download {symbol} to {filename}. Error: {e}")
+                    logging.info(f"Failed backup. Symbol: {symbol}")
                     with open("dags/error_log_backup/error_log_weekly_data/error_log.txt", "a") as f:
                         f.write(f"{symbol}\n")
-                    break
-        # Pass retry limit
-        else:
-            logging.info(
-                f"Exceeded maximum retries ({max_retries}). File {f'{symbol}.csv'} could not be downloaded.")
-            with open("dags/error_log_backup/error_log_weekly_data/error_log.txt", "a") as f:
-                f.write(f"{symbol}\n")
+                    return (symbol, None)
+
+    with ThreadPoolExecutor(max_workers=5) as executors:
+        results = list(executors.map(download_url, inputs))
+        
 
 
 def backup_full(**kwargs):
@@ -194,19 +171,20 @@ def backup_full(**kwargs):
 
     # Extract full historical data as of today as backup
     list_filenames = minio_client.list_objects(bucket_name=bucket_name_1)
-
-    # Secure full backup
-    for filename in list_filenames:
+        
+    def update_backup(args):
+        filename = args
         try:
             start = time.time()
             minio_client.copy_object(bucket_name_from=bucket_name_1, bucket_name_to=bucket_name_2,
-                                        obj_name=filename, prefix_2=f"backup_{datetime.today().strftime('%Y-%m-%d')}")
-            logging.info(
-                f"Backup file {filename} successfully. Runtime: {time.time() - start} seconds.")
+                                        obj_name=filename, prefix_2=f"backup_{datetime.today().strftime('%Y-%m-%d')}_full")
+            logging.info(f"Successful backup. Filename: {filename}. Runtime: {time.time() - start}")
+            return(time.time() - start)
         except Exception as e:
-            logging.info(f"Failed to backup file {filename}. Error: {e}")
-            continue
-
+            logging.info(f"Failed to backup file {filename}. Error: {e}")    
+            
+    with ThreadPoolExecutor(max_workers=5) as executors:
+        results = list(executors.map(update_backup, list_filenames))
 
 def daily_update(**kwargs):
     # # Arguments for the function
@@ -218,45 +196,55 @@ def daily_update(**kwargs):
 
     # List symbols
     if symbols == None:
-        symbols = [x.split(".")[0] for x in minio_client.list_objects(
-            bucket_name=bucket_name)]
+        symbols = [x.split(".")[0] for x in minio_client.list_objects(bucket_name=bucket_name)]
 
     # Retry strategy
-    max_retries = 5
 
     midnight = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0)
     a_day_ago = midnight - timedelta(days=1)
     current_day = int(midnight.timestamp())
     a_day_ago = int(a_day_ago.timestamp())
+    
+    url_1 = lambda symbol: f"https://query1.finance.yahoo.com/v7/finance/download/{symbol}?period1={a_day_ago}&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
+    url_2 = lambda symbol: f"https://query2.finance.yahoo.com/v7/finance/download/{symbol}?period1={a_day_ago}&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
 
-    for symbol in symbols:
+    urls_1 = [url_1(x) for x in symbols]
+    urls_2 = [url_2(x) for x in symbols]
+    inputs = zip(urls_1, urls_2, symbols)    
 
-        # Extract CSV content from bucket
-        csv_content_raw = minio_client.get_object(
-            bucket_name=bucket_name, obj_name=f'{symbol}.csv').data.decode('utf-8')
-
-        # Header for requests
-        headers = header_csv
-
-        # Start reading the CSV content
-        csv_reader = csv.reader(io.StringIO(csv_content_raw))
-        temp_row_holder = [row for row in csv_reader]
-        latest_row = temp_row_holder[-1]
-        if latest_row[0] == (midnight - timedelta(days=1)).strftime("%Y-%m-%d"):
-            continue
-
-        for attempt in range(max_retries):
-
-            # Extract the latest row from website
-            url = lambda x: f"https://query{x}.finance.yahoo.com/v7/finance/download/{symbol}?period1={a_day_ago}&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
-
-            # Check query1
+    # Download url
+    def download_url(args):
+        url_1, url_2, symbol = args[0], args[1], args[2]
+        start = time.time()
+        try:
+            response = requests.get(url_1, headers=header_csv)
+            # Check response status code
+            if response.status_code == 200:
+                latest_row_content = response.content.decode('utf-8').split("\n")[1].split(",").append(symbol)
+                upsert_query = '''
+                                INSERT INTO dim_hist_data ("Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Symbol")
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT ("Symbol", "Date")
+                                DO UPDATE SET
+                                "Open" = EXCLUDED."Open",
+                                "High" = EXCLUDED."High",
+                                "Low" = EXCLUDED."Low",
+                                "Close" = EXCLUDED."Close",
+                                "Adj Close" = EXCLUDED."Adj Close",
+                                "Volume" = EXCLUDED."Volume"    
+                                '''
+                cursor.execute(upsert_query, tuple(latest_row_content))
+                return(time.time() - start)
+            elif response.status_code == 429:
+                logging.info(f"Failed to update latest rows for {symbol}. Status code: {response.status_code}.")
+        except Exception as e:
+            conn.rollback()
             try:
-                response = requests.get(url(1), headers=headers)
-                # Check response status code
+                response = requests.get(url_2, headers=header_csv)
                 if response.status_code == 200:
-                    latest_row_content = response.content.decode('utf-8').split("\n")[1].split(",")
+                    latest_row_content = response.content.decode(
+                        'utf-8').split("\n")[1].split(",").append(symbol)
                     upsert_query = '''
                                     INSERT INTO dim_hist_data ("Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Symbol")
                                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -270,42 +258,21 @@ def daily_update(**kwargs):
                                     "Volume" = EXCLUDED."Volume"    
                                     '''
                     cursor.execute(upsert_query, tuple(latest_row_content))
-                    break
+                    return(time.time() - start)
+                elif response.status_code == 429:
+                    logging.info(f"Failed to update latest rows for {symbol}. Status code: {response.status_code}.")
             except Exception as e:
                 conn.rollback()
-                try:
-                    response = requests.get(url(2), headers=headers)
-                    if response.status_code == 200:
-                        latest_row_content = response.content.decode('utf-8').split("\n")[1].split(",")
-                        upsert_query = '''
-                                        INSERT INTO dim_hist_data ("Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Symbol")
-                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                                        ON CONFLICT ("Symbol", "Date")
-                                        DO UPDATE SET
-                                        "Open" = EXCLUDED."Open",
-                                        "High" = EXCLUDED."High",
-                                        "Low" = EXCLUDED."Low",
-                                        "Close" = EXCLUDED."Close",
-                                        "Adj Close" = EXCLUDED."Adj Close",
-                                        "Volume" = EXCLUDED."Volume"    
-                                        '''
-                        cursor.execute(upsert_query, tuple(latest_row_content))
-                        break
-                    else:
-                        print(f"Failed to update latest rows for {symbol}.csv")
-                        break
-                except Exception as e:
-                    conn.rollback()
-                    logging.info(
-                        f"Exceeded maximum retries ({max_retries}). File {f'{symbol}.csv'} could not be downloaded.")
-                    with open("dags/error_log_backup/error_log_daily_update/error_log.txt", "a") as f:
-                        f.write(f"{symbol}\n")
-                    continue
-        else:
-            logging.info(
-                f"Exceeded maximum retries ({max_retries}). File {f'{symbol}.csv'} could not be downloaded.")
-            with open("dags/error_log_backup/error_log_daily_update/error_log.txt", "a") as f:
-                f.write(f"{symbol}\n")
+                logging.info(
+                        f"Failed to update latest rows for {symbol}. File {f'{symbol}.csv'} could not be downloaded.")
+                with open("dags/error_log_backup/error_log_daily_update/error_log.txt", "a") as f:
+                    f.write(f"{symbol}\n")
+
+    with ThreadPoolExecutor(max_workers=5) as executors:
+        results = list(executors.map(download_url, inputs))
+    
+    conn_1.close()
+    conn.close()
 
 
 def daily_update_staging(**kwargs):
@@ -313,16 +280,14 @@ def daily_update_staging(**kwargs):
     # Arguments for the function
     symbols = kwargs.get("symbols")
     bucket_name = kwargs.get("bucket_name")
-    
+
     if symbols == None:
         symbols = [x.split(".")[0] for x in minio_client.list_objects(
             bucket_name=bucket_name)]
 
     midnight = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0)
-    a_day_ago = midnight - timedelta(days=1)
     current_day = int(midnight.timestamp())
-    a_day_ago = int(a_day_ago.timestamp())
 
     # Retry strategy
     max_retries = 5
@@ -333,65 +298,59 @@ def daily_update_staging(**kwargs):
 
     # Minio Client
     minio_client = MinioClient('minio', 9000, access_key, secret_key)
-
-    # Extract CSV content
-    for symbol in symbols:
-
-        # Filename
-        filename = f'{symbol}.csv'
-
-        # Retry logic attempt
+    
+    def url_1(symbol): return f"https://query1.finance.yahoo.com/v7/finance/download/{symbol}?period1=942935400&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
+    
+    def url_2(symbol): return f"https://query2.finance.yahoo.com/v7/finance/download/{symbol}?period1=942935400&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
+    
+    filename_func = lambda symbol: f'{symbol}.csv'
+    
+    urls_1 = [url_1(symbol) for symbol in symbols]
+    urls_2 = [url_2(symbol) for symbol in symbols]
+    inputs = zip(urls_1, urls_2, symbols)
+    
+    def daily_update(args):
+        start = time.time()
+        url_1, url_2, symbol = args[0], args[1], args[2]
+        filename = filename_func(symbol)
         for attempt in range(max_retries):
-
-            # URL for requests
-            url = lambda x: f"https://query{x}.finance.yahoo.com/v7/finance/download/{symbol}?period1=942935400&period2={current_day}&interval=1d&events=history&includeAdjustedClose=true"
-
-            # Check query1
             try:
-                response = requests.get(url(1), headers=headers)
-                # Check response status code
+                response = requests.get(url_1, headers=headers)
                 if response.status_code == 200:
                     with open(filename, 'wb') as f:
                         f.write(response.content)
                     minio_client.put_object(
                         bucket_name=bucket_name, obj_name=filename, obj_file=filename)
-                    logging.info(f'Successfully downloaded {symbol} to {filename}')
-                    break
+                    logging.info(
+                        f'Successfully downloaded {filename}. Runtime: {time.time() - start}')
+                    return (symbol, time.time() - start)
                 elif response.status_code == 429:
                     time.sleep(delay)
             except Exception as e:
-                # query1 failed
-                # Check query2
                 try:
-                    response = requests.get(url(2), headers=headers)
-                    # Check response status code
+                    response = requests.get(url_2, headers=headers)
                     if response.status_code == 200:
                         with open(filename, 'wb') as f:
                             f.write(response.content)
                         minio_client.put_object(
                             bucket_name=bucket_name, obj_name=filename, obj_file=filename)
                         logging.info(
-                            f'Successfully downloaded {symbol} to {filename}')
-                        break
+                            f'Successfully downloaded {filename}. Runtime: {time.time() - start}')
+                        return (symbol, time.time() - start)
                     elif response.status_code == 429:
                         time.sleep(delay)
-                    # query2 failed
-                    else:
-                        logging.info(
-                            f"Exceeded maximum retries ({max_retries}). File {f'{symbol}.csv'} could not be downloaded.")
-                        with open("dags/error_log_backup/error_log_daily_update/error_log_staging.txt", "a") as f:
-                            f.write(f"{symbol}\n")
-                        break
                 except Exception as e:
-                    logging.info(
-                        f'Failed to download {symbol} to {filename}. Error: {e}')
-                    continue
-        # Pass retry limit
+                    logging.info(f'Failed to download {filename}. Error: {e}')
+                    return (symbol, None)
         else:
             logging.info(
                 f"Exceeded maximum retries ({max_retries}). File {f'{symbol}.csv'} could not be downloaded.")
             with open("dags/error_log_backup/error_log_daily_update/error_log_staging.txt", "a") as f:
                 f.write(f"{symbol}\n")
+            return (symbol, None)
+        
+    with ThreadPoolExecutor(max_workers=10) as executors:
+        results = list(executors.map(daily_update, inputs))
 
 
 extract_symbol_dag = PythonOperator(
@@ -440,4 +399,5 @@ update_daily_dag = PythonOperator(
     dag=dag
 )
 
-extract_symbol_dag >> weekly_data_backup_dag >> update_daily_dag >> backup_full_dag
+extract_symbol_dag >> weekly_data_backup_dag >> [
+    update_daily_dag, update_daily_staging_dag] >> backup_full_dag
